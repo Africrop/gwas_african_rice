@@ -1,0 +1,91 @@
+---
+title: "Imputation for LEA analysis"
+output:
+  html_document: default
+  html_notebook: default
+---
+
+## Introduction
+
+This is a script intended to compute an imputed datafile for association analysis on rice. We will run the chunks defined here on the IRD bio-informatic cluster. All the material in this notebook is for reference and putative additions/re-run.
+
+We assume that the required libraries are already present on the system. If you intend to run this onto the cluster, you'll first have to install the required libraries onto your home directory. I had troubles with the gcc compiler while trying to install the cate library, due to missing path to some libraries (namely liblapack and libblas). To solve this problem if it arise, simply add the following line to you .bashrc file in your home directory : "export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib64".
+
+```{r, eval=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+library(LEA)
+library(cate)
+library(data.table)
+```
+
+### Genomic data
+
+For african rice, we used the MSU7 reference based called VCF produced by Christine Dubreuil-Tranchant in the frame of the IRIGIN project. The initial VCF files where those partitioned by chromosomes and named "OgOb-all-MSU7-CHRX.SNPEFF.FILTERED.NA.225Homoz.minmaxAllele2.recode-AF1bis.vcf". These where produced after applying different quality filters (see Christine for details). These VCFs were therefore simplified to keep only genotype information, and diploid individuals were simplifed to haploids, with heterozygote positions randomly assigned to the reference or derived allele. The resulting haploid VCFs were then combined for all glaberrima genotypes, resulting in a single VCF for 163 haploid genotypes. We applied a minimal allele count filter to ensure we only have positions present more than one time in the resulting VCF, keeping  892539 SNPs.
+
+### Getting the data
+The following code will launch the haploid VCF. It should easily be tailored to deal with diploid VCFs.
+
+```{r VCF treatment, eval=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+#### define the file to be processed ####
+input <- "glab_allChr.recode.HAPLO.NEW_mac2.recode.vcf"
+
+
+#### Open the connection and determine the length (in row) of the header ####
+con <- file(input, open='r')
+i <- 1
+test <- readLines(con,n=1)
+while(grepl(pattern="#", test)==TRUE){
+  test <- readLines(con,n=1)
+  i <- i+1
+} 
+close(con)
+
+#### Open a new connection to read only the last line of the header ####
+con <- file(input, open='r')
+i <- i-1
+header <- readLines(con,n=i)
+close(con)
+head <- unlist(strsplit(header[length(header)], split="\t"))
+
+#### Read the data and create the header ####
+vcf_haplo <- fread(input, header = FALSE, skip=i ,colClasses =  "character")
+colnames(vcf_haplo) <- head
+
+#### Keep only usefull information and replace missing data code (from "." to "9")
+vcf_haplo <- vcf_haplo[,-c(3:9)]
+vcf_haplo[vcf_haplo=="."] <- "9"
+# vcf_haplo[,3:ncol(vcf_haplo)] <- apply(vcf_haplo[,3:ncol(vcf_haplo)],2,as.numeric)
+vcf_haplo <- vcf_haplo[,lapply(.SD,as.numeric),by=c("#CHROM","POS")]
+```
+We will now produce intermediate datafiles in the lfmm format to be processed with LEA.
+
+```{r producing lfmm datafile, eval=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+# snps datafile
+genotype <- vcf_haplo[,3:ncol(vcf_haplo)]
+genotype <- t(genotype)
+write.lfmm(R = genotype,output.file = "genotype.lfmm")
+```
+
+## Genome imputation
+
+LFMM and cate works only on complete datasets (i.e. no missing data allowed). We have to impute missing data in order to proceed with the analysis, this can be done using the snmf function of LEA.
+
+```{r genome imputation, eval=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+# imputation (using 10 reps, might be more), K choice to be based on PCA, snmf,...
+obj.snmf = snmf(input.file="genotype.lfmm", K=4, entropy=T, ploidy = 1, project="new", rep=10)
+best = which.min(cross.entropy(obj.snmf, K = 4))
+impute(object = obj.snmf, input.file="genotype.lfmm", K = 4, run = best)
+
+# cleaning
+remove.snmfProject("genotype.snmfProject")
+unlink("genotype.snmf/",recursive = TRUE)
+```
+
+## Create file containing metadata for future analysis
+```{r, eval=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+genotype <- read.lfmm("genotype.lfmm_imputed.lfmm")
+genotype <- t(genotype)
+vcf_haplo_imputed <- cbind(vcf_haplo[,1:2],genotype)
+colnames(vcf_haplo_imputed) <- colnames(vcf_haplo)
+fwrite(vcf_haplo_imputed,"glab_genotype_imputed_with_metadata.txt")
+```
+

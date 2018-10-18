@@ -1,0 +1,190 @@
+---
+title: "LFMM_tutorial"
+author: "Philippe Cubry, Olivier Francois & Helene Pidon"
+date: "11 juillet 2017"
+output: html_document
+---
+<style>
+div.blue pre { background-color:lightblue; }
+div.blue pre.r { background-color:lightblue; }
+</style>
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+This is a tutorial to use the LFMM and cate method for association analysis, based on materials from Olivier Francois available at http://membres-timc.imag.fr/Olivier.Francois/LEA/index.htm. Basically this kind of association analysis estimate confounding factors (e.g. do to genetic correlations) while performing the association analysis and thus do not need an external structure or kinsjip matrix.
+
+The first thing to do is to get the latest available version of LEA, that you can get from github. If you already have LEA in your computer, you might skip this step. We also install the "cate" package.
+
+```{r LEA and GABIT setup, eval=FALSE}
+# Install the package devtools to get packages from github
+install.packages("devtools")
+
+# Now you should be able to install LEA directly from its github repository, you might be asked to install additional packages to be able to build packages from sources. If so, you might need to launch again the command line. Please be patient, it might take a while !
+devtools::install_github("bcm-uga/LEA")
+
+
+
+source("https://bioconductor.org/biocLite.R")
+biocLite("sva")
+biocLite("multtest")
+install.packages("cate",dependencies = TRUE)
+
+# Regarding emma, it must be install from source downloaded at http://mouse.cs.ucla.edu/emma/news.html
+#you may also need to install the data.table package
+install.packages("data.table") 
+
+# The following packages are required to use GAPIT
+install.packages("gplots")
+install.packages("LDheatmap")
+install.packages("genetics")
+install.packages("MASS")
+install.packages("RColorBrewer")
+install.packages("scatterplot3d")
+```
+
+Now we'll launch the libraries.
+
+```{r, eval=FALSE}
+library(LEA)
+library(cate)
+library(data.table)
+
+# Here are the packages nessessary for GAPIT
+source("http://www.bioconductor.org/biocLite.R")
+library("gplots")
+library("LDheatmap")
+library("genetics")
+library("MASS")
+library("compiler")
+library("RColorBrewer")
+library("multtest")
+library("scatterplot3d")
+source("http://www.zzlab.net/GAPIT/emma.txt") # modification of emma library
+source("http://www.zzlab.net/GAPIT/gapit_functions.txt") # source code for GAPIT
+```
+
+## Dataset presentation
+
+### Genomic data
+
+The genomic data we will use is resulting from a process of the MSU7 reference based called VCF produced by Christine Dubreuil-Tranchant in the frame of the IRIGIN project. The initial VCF files where those partitioned by chromosomes and named "OgOb-all-MSU7-CHRX.SNPEFF.FILTERED.NA.225Homoz.minmaxAllele2.recode-AF1bis.vcf". These where produced after applying different quality filters (see Christine for details). These VCFs were therefore simplified to keep only genotype information, and diploid individuals were simplifed to haploids, with heterozygote positions randomly assigned to the reference or derived allele. The resulting haploid VCFs were then combined for all glaberrima genotypes, resulting in a single VCF for 163 haploid genotypes. We applied a minimal allele count filter to ensure we only have positions present more than one time in the resulting VCF, keeping  892539 SNPs. This vcf was the processed in order to impute missing data on the basis of genetic structure (this is a method implemented in the LEA package). The file we will use here is simply a matrix containing 0 and 1 (O for the reference allele, 1 for the derived allele) with informations about individuals and positions.
+
+### Getting the data
+The following code will launch a toy datafile that consist of randomly picked SNPs in the whole file. It is very easy to modify it to handle the complete file.
+```{r launch genotypes, eval=FALSE}
+genotype <- fread("glab_genotype_imputed_with_metadata_200000sampled.txt",header = TRUE)
+# genotype <- fread("glab_genotype_imputed_with_metadata.txt",header = TRUE)
+```
+
+
+### Phenotypic data
+Four variables reporting the flowering dates are available. These data represent two years of experiments (2012 and 2014), with each early and late sowing. Additional two variables are the differences between the yearly repetitions. We will only use the variable (DFT2014a) for the sake of the example.
+
+```{r launch phenotype, eval=FALSE}
+pheno <- read.table("floweringtime_6traits.txt",na.strings = "NaN",header = TRUE)
+flowering_time <- na.exclude(pheno[,c(1,which(colnames(pheno)=="DFT2014a"))])
+row.names(flowering_time) <- flowering_time$Code_ADN
+```
+
+Now we can see that we only have data for 160 genotypes, while having genomic data for 163, so we need to filter out the additional genotypes. WARNING: verify that the order of accessions is the same between the phenotypic and genomic files after filtering out individuals.
+
+```{r filtering genotypes from genomic data, eval=FALSE}
+genotype <- genotype[,c(1,2,which(colnames(genotype) %in% row.names(flowering_time))),with=FALSE] # This is an adapted call using the data.table way of indexing
+```
+
+We can also apply a filter on the MAF, say 5%.
+```{r maf filtering, eval=FALSE}
+# MAF function
+maf = function(x){ 
+  x = x[x != 9]
+  f = sum(x) ; (min(f , length(x) - f ))/length(x)}
+
+# Computing MAF per SNP
+maf_genotype <- apply(genotype[,3:ncol(genotype)],1,maf)
+genotype$maf <- maf_genotype
+# Filtering data for MAF > 5%
+genotype <- genotype[which(genotype$maf>0.05),]
+```
+For future reference and use, we will now save the positions of the retained SNPs and the list of individuals.
+```{r save positions, eval=FALSE}
+retained_snps <- data.frame(genotype[["#CHROM"]],genotype[["POS"]],genotype[["maf"]])
+genotype$maf <- NULL #remove the maf column
+write.table(retained_snps,file = "chrpos.txt")
+
+individuals=colnames(genotype)[3:(ncol(genotype))]
+write.table(individuals,file = "indiv.txt")
+```
+
+## Producing files
+
+We will now produce intermediate lfmm and env files for the analysis.
+
+```{r creating intermediate files, eval=FALSE}
+genotype.gapit <- data.frame(paste(genotype$`#CHROM`,genotype$POS,sep="_"),genotype[,3:ncol(genotype)])
+genotype <- genotype[,3:ncol(genotype)]
+genotype <- t(genotype)
+write.lfmm(R = genotype,output.file = "genotype.lfmm")
+write.table(flowering_time[2],"pheno.env",row.names = FALSE,col.names = FALSE)
+write.table(flowering_time,"pheno2.env",row.names = FALSE,col.names = TRUE)
+```
+
+## Association analysis
+We will now proceed with the GWAS analysis. We will use both lfmm (from package LEA) and cate.
+
+```{r lfmm association, eval=FALSE}
+mod.lfmm = lfmm("genotype.lfmm", "pheno.env", K = 4, iterations = 5000, burnin = 2600, CPU = 4, repetitions = 10, project = "new")
+pv.lfmm = lfmm.pvalues(mod.lfmm, K = 4)
+remove.lfmmProject("genotype_pheno.lfmmProject")
+```
+
+```{r cate association, eval=FALSE}
+genotype = read.lfmm("genotype.lfmm")
+x = read.table("pheno.env")[,1]
+mod.cate = cate( ~ x, X.data = data.frame(x), Y = as.matrix(genotype), r = 4, fa.method = "pc", calibrate = TRUE)
+pv.cate = mod.cate$beta.p.value
+```
+
+```{r emma, eval= FALSE}
+Kinship <- emma.kinship(t(genotype),"additive","all")   #genotypes imputés
+mod.emma <- emma.REML.t( x, t(genotype), Kinship)  #x = DFT2014a
+pv.emma <- mod.emma$ps
+```
+
+We can now make a manhattan plot of the resulting analysis
+```{r plot cate, eval=FALSE}
+chrpos <- read.table("chrpos.txt")
+{plot( -log10(pv.cate), pch = 19, cex = .6, col = chrpos$genotype....CHROM..., main = "Flowering time (DFT2014a)", xlab = "Chromosome", ylab = "-log10(p-value)", tcl = NA, col.axis = "white", axes = FALSE)
+axis(side = 2, at = unique(round(-log10(pv.cate))) , labels = unique(round(-log10(pv.cate))) , las = 2)
+}
+```
+```{r plot emma, eval=FALSE}
+chrpos <- read.table("chrpos.txt")
+{plot( -log10(pv.emma), pch = 19, cex = .6, col = chrpos$genotype....CHROM..., main = "Flowering time (DFT2014a)", xlab = "Chromosome", ylab = "-log10(p-value)", tcl = NA, col.axis = "white", axes = FALSE)
+axis(side = 2, at = unique(round(-log10(pv.emma))) , labels = unique(round(-log10(pv.emma))) , las = 2)
+}
+```
+
+GAPIT will generate a lot of files, including manhattan plots
+<div class = "blue">
+```{r GAPIT, eval= FALSE}
+individuals <- read.table("indiv.txt",header=T,na.string="NaN")
+retained_snps <- read.table("chrpos.txt")[,c(1,2)]
+geno=genotype
+colnames(geno)=paste(retained_snps$genotype....CHROM...,retained_snps$genotype...POS...,sep="_")
+geno[geno==1] <- 2
+myGD=data.frame(individuals,geno)
+
+myGM=cbind(colnames(geno),retained_snps)
+colnames(myGM)=c("name","CHROM","POS")
+myGM$CHROM=gsub("Chr","",myGM$CHROM)
+
+myP=read.table("pheno2.env",header=TRUE,na.string="NaN")
+
+myGAPIT<-GAPIT(Y=myP,GD=myGD,GM=myGM,PCA.total=4,memo="MLM")
+```
+</div>
